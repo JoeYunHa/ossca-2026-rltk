@@ -84,6 +84,8 @@ impl Map {
     }
 
     fn carve_room(&mut self, room: &Rect) {
+        // +1 offset intentionally leaves a one-tile wall border on all sides,
+        // so the carved floor is (w-1)×(h-1) relative to the Rect's nominal size.
         for y in (room.y1 + 1)..room.y2 {
             for x in (room.x1 + 1)..room.x2 {
                 let i = self.idx(x, y);
@@ -171,6 +173,11 @@ struct State {
     monsters: Vec<Monster>,
     run_state: RunState,
     log: String,
+    /// Pre-padded HUD line for key status; updated only when has_key changes.
+    key_status_line: String,
+    /// Pre-formatted strings for the level-clear screen; computed once per level.
+    level_clear_title: String,
+    level_clear_prompt: String,
     level: u32,
     /// Accumulated time since last monster move, in milliseconds.
     monster_timer: f32,
@@ -182,43 +189,46 @@ struct State {
 
 impl State {
     fn build(level: u32) -> Self {
-        let mut map = Map::new();
         let mut rng = RandomNumberGenerator::new();
-        let mut rooms: Vec<Rect> = Vec::new();
 
-        // Generate rooms — attempt many placements to fill the map
-        for _ in 0..30 {
-            let w = rng.range(4, 11);
-            let h = rng.range(4, 11);
-            let x = rng.range(1, MAP_W - w - 1);
-            let y = rng.range(1, MAP_H - h - 1);
-            let room = Rect::with_size(x, y, w, h);
+        // Retry until at least 2 non-overlapping rooms are placed (very rare to need >1 try).
+        let (mut map, rooms) = loop {
+            let mut map = Map::new();
+            let mut rooms: Vec<Rect> = Vec::new();
 
-            if rooms.iter().all(|r| !r.intersect(&room)) {
-                map.carve_room(&room);
-                if let Some(prev) = rooms.last() {
-                    let c1 = prev.center();
-                    let c2 = room.center();
-                    if rng.range(0, 2) == 0 {
-                        map.carve_h_tunnel(c1.x, c2.x, c1.y);
-                        map.carve_v_tunnel(c1.y, c2.y, c2.x);
-                    } else {
-                        map.carve_v_tunnel(c1.y, c2.y, c1.x);
-                        map.carve_h_tunnel(c1.x, c2.x, c2.y);
+            // Generate rooms — attempt many placements to fill the map
+            for _ in 0..30 {
+                let w = rng.range(4, 11);
+                let h = rng.range(4, 11);
+                let x = rng.range(1, MAP_W - w - 1);
+                let y = rng.range(1, MAP_H - h - 1);
+                let room = Rect::with_size(x, y, w, h);
+
+                if rooms.iter().all(|r| !r.intersect(&room)) {
+                    map.carve_room(&room);
+                    if let Some(prev) = rooms.last() {
+                        let c1 = prev.center();
+                        let c2 = room.center();
+                        if rng.range(0, 2) == 0 {
+                            map.carve_h_tunnel(c1.x, c2.x, c1.y);
+                            map.carve_v_tunnel(c1.y, c2.y, c2.x);
+                        } else {
+                            map.carve_v_tunnel(c1.y, c2.y, c1.x);
+                            map.carve_h_tunnel(c1.x, c2.x, c2.y);
+                        }
+                    }
+                    rooms.push(room);
+                    // Ensure enough rooms for all monsters plus start and exit
+                    if rooms.len() >= (MAX_LEVEL as usize) + 2 {
+                        break;
                     }
                 }
-                rooms.push(room);
-                // Ensure enough rooms for all monsters plus start and exit
-                if rooms.len() >= (MAX_LEVEL as usize) + 2 {
-                    break;
-                }
             }
-        }
 
-        // Retry if the RNG produced too few non-overlapping rooms (rare)
-        if rooms.len() < 2 {
-            return Self::build(level);
-        }
+            if rooms.len() >= 2 {
+                break (map, rooms);
+            }
+        };
 
         // Player starts at center of first room
         let start = rooms[0].center();
@@ -239,10 +249,15 @@ impl State {
         let key_pos = if key_idx != exit_idx {
             Some(key_idx)
         } else {
-            // Fallback: use the room before the exit room.
+            // Fallback 1: use the room before the exit room.
             let fallback = rooms[rooms.len().saturating_sub(2)].center();
             let fidx = map.idx(fallback.x, fallback.y);
-            if fidx != exit_idx { Some(fidx) } else { None }
+            if fidx != exit_idx {
+                Some(fidx)
+            } else {
+                // Fallback 2: place at the player's start tile so the level is always winnable.
+                Some(player_pos)
+            }
         };
 
         // Place exactly `level` monsters in the non-start rooms nearest the exit.
@@ -276,6 +291,9 @@ impl State {
                 "Level {}/{}  Pick up key (k), reach exit (>), avoid goblins (g). [Arrow/WASD]",
                 level, MAX_LEVEL
             )),
+            key_status_line: hud("[KEY: not found] Find the key (k) to unlock the exit."),
+            level_clear_title: format!("  Level {} Cleared!  ", level),
+            level_clear_prompt: format!("Press Space to continue to Level {}", level + 1),
             level,
             monster_timer: 0.0,
             rng,
@@ -306,6 +324,7 @@ impl State {
             self.has_key = true;
             self.key_pos = None;
             self.log = hud("You picked up the key! Now reach the exit (>).");
+            self.key_status_line = hud("[KEY: acquired] Reach the exit (>)!");
         }
 
         if self.map.tiles[new_pos] == TileType::Exit {
@@ -493,15 +512,10 @@ impl State {
             ColorPair::new(RGB::named(CYAN), RGB::named(BLACK)),
         );
 
-        // HUD row 49: key status indicator
-        let key_status = if self.has_key {
-            hud("[KEY: acquired] Reach the exit (>)!")
-        } else {
-            hud("[KEY: not found] Find the key (k) to unlock the exit.")
-        };
+        // HUD row 49: key status indicator (pre-padded string, no allocation per frame)
         draw_batch.print_color(
             Point::new(0, 49),
-            key_status.as_str(),
+            self.key_status_line.as_str(),
             ColorPair::new(
                 if self.has_key { RGB::from_f32(1.0, 0.85, 0.0) } else { RGB::named(GREY) },
                 RGB::named(BLACK),
@@ -522,12 +536,12 @@ impl State {
 
         draw_batch.print_color(
             Point::new(28, 22),
-            format!("  Level {} Cleared!  ", self.level),
+            self.level_clear_title.as_str(),
             ColorPair::new(RGB::named(GREEN), RGB::named(BLACK)),
         );
         draw_batch.print_color(
             Point::new(21, 24),
-            format!("Press Space to continue to Level {}", self.level + 1),
+            self.level_clear_prompt.as_str(),
             ColorPair::new(RGB::named(WHITE), RGB::named(BLACK)),
         );
 
@@ -613,7 +627,7 @@ impl GameState for State {
                 }
 
                 // Monsters move on their own timer, independent of player input.
-                // Speed increases each level: level 1 = 800 ms, level 5 = 400 ms.
+                // Speed increases each level: level 1 = 500 ms, level 5 = 100 ms.
                 let monster_interval =
                     MONSTER_BASE_MS - (self.level - 1) as f32 * MONSTER_SPEED_STEP_MS;
                 self.monster_timer += ctx.frame_time_ms;
