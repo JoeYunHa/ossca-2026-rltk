@@ -2,6 +2,7 @@ bracket_terminal::add_wasm_support!();
 use bracket_pathfinding::prelude::*;
 use bracket_random::prelude::*;
 use bracket_terminal::prelude::*;
+use std::collections::VecDeque;
 
 // Map dimensions: leave rows 48-49 for the HUD
 const MAP_W: i32 = 80;
@@ -11,6 +12,29 @@ const MAX_LEVEL: u32 = 5;
 /// Base monster move interval in milliseconds; decreases by this amount each level.
 const MONSTER_BASE_MS: f32 = 500.0;
 const MONSTER_SPEED_STEP_MS: f32 = 100.0;
+
+const TOAST_DURATION_MS: f32 = 2500.0;
+const FOV_TOAST_COOLDOWN_MS: f32 = 1500.0;
+const MAX_TOASTS: usize = 4;
+const TOAST_X: i32 = 40;
+const TOAST_WIDTH: usize = 40;
+
+// Toast message literals — pre-padded to exactly TOAST_WIDTH chars so the
+// background fill covers the full slot without any per-frame allocation.
+const TOAST_RNG_MAP:    &str = " [RNG] RandomNumberGenerator: map built ";
+const TOAST_FOV:        &str = " [FOV] field_of_view_set() computed     ";
+const TOAST_A_CHASE:    &str = " [A* ] a_star_search(): chasing!        ";
+const TOAST_A_SEARCH:   &str = " [A* ] a_star_search(): searching...    ";
+const TOAST_RNG_WANDER: &str = " [RNG] random_step(): monster wandering ";
+
+// Compile-time: every message must be exactly TOAST_WIDTH bytes (ASCII-only).
+const _: () = assert!(TOAST_RNG_MAP.len()    == TOAST_WIDTH);
+const _: () = assert!(TOAST_FOV.len()        == TOAST_WIDTH);
+const _: () = assert!(TOAST_A_CHASE.len()    == TOAST_WIDTH);
+const _: () = assert!(TOAST_A_SEARCH.len()   == TOAST_WIDTH);
+const _: () = assert!(TOAST_RNG_WANDER.len() == TOAST_WIDTH);
+// Compile-time: toast column + width must equal terminal width exactly.
+const _: () = assert!(TOAST_X as usize + TOAST_WIDTH == MAP_W as usize);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -46,6 +70,14 @@ fn random_step(pos: usize, map: &Map, rng: &mut RandomNumberGenerator) -> usize 
     } else {
         candidates[rng.range(0, count as i32) as usize]
     }
+}
+
+// ── Toast notification ────────────────────────────────────────────────────────
+
+struct Toast {
+    message: &'static str,
+    remaining_ms: f32,
+    color: RGB,
 }
 
 // ── Tile types ────────────────────────────────────────────────────────────────
@@ -185,6 +217,8 @@ struct State {
     /// Map index of the key; None once the player has picked it up.
     key_pos: Option<usize>,
     has_key: bool,
+    toasts: VecDeque<Toast>,
+    fov_toast_cooldown: f32,
 }
 
 impl State {
@@ -299,7 +333,12 @@ impl State {
             rng,
             key_pos,
             has_key: false,
+            toasts: VecDeque::new(),
+            // Non-zero initial value suppresses a redundant FOV toast on the
+            // very first player step (FOV is already computed in update_fov below).
+            fov_toast_cooldown: FOV_TOAST_COOLDOWN_MS,
         };
+        state.push_toast(TOAST_RNG_MAP, RGB::named(MAGENTA));
         // Initialise FOV before the first tick so tiles are visible immediately
         state.update_fov();
         state
@@ -342,6 +381,26 @@ impl State {
                 self.log = hud("All levels cleared! GAME COMPLETE!");
             }
         }
+    }
+
+    fn push_toast(&mut self, message: &'static str, color: RGB) {
+        // Dedup check on the pointer/bytes directly — no allocation.
+        if let Some(t) = self.toasts.iter_mut().find(|t| t.message == message) {
+            t.remaining_ms = TOAST_DURATION_MS;
+            return;
+        }
+        if self.toasts.len() >= MAX_TOASTS {
+            self.toasts.pop_front(); // O(1) on VecDeque; Vec::remove(0) would be O(n)
+        }
+        self.toasts.push_back(Toast { message, remaining_ms: TOAST_DURATION_MS, color });
+    }
+
+    fn update_toasts(&mut self, delta_ms: f32) {
+        self.toasts.retain_mut(|t| {
+            t.remaining_ms -= delta_ms;
+            t.remaining_ms > 0.0
+        });
+        self.fov_toast_cooldown = (self.fov_toast_cooldown - delta_ms).max(0.0);
     }
 
     fn update_fov(&mut self) {
@@ -412,10 +471,32 @@ impl State {
             };
         }
 
-        for (m, &(pos, alerted, last_known)) in self.monsters.iter_mut().zip(updates[..n].iter()) {
+        let mut transitions: [u8; MAX_LEVEL as usize] = [0; MAX_LEVEL as usize];
+        for (i, (m, &(pos, alerted, last_known))) in
+            self.monsters.iter_mut().zip(updates[..n].iter()).enumerate()
+        {
+            let was_alerted = m.alerted;
+            let had_memory = m.last_known_pos.is_some();
             m.pos = pos;
             m.alerted = alerted;
             m.last_known_pos = last_known;
+            transitions[i] = if alerted && !was_alerted {
+                1
+            } else if !alerted && last_known.is_some() && was_alerted {
+                2
+            } else if !alerted && last_known.is_none() && had_memory {
+                3
+            } else {
+                0
+            };
+        }
+        for t in &transitions[..n] {
+            match t {
+                1 => self.push_toast(TOAST_A_CHASE,   RGB::named(RED)),
+                2 => self.push_toast(TOAST_A_SEARCH,  RGB::from_f32(1.0, 0.5, 0.0)),
+                3 => self.push_toast(TOAST_RNG_WANDER, RGB::named(YELLOW)),
+                _ => {}
+            }
         }
 
         if self.monsters.iter().any(|m| m.pos == player_pos) {
@@ -504,6 +585,16 @@ impl State {
             "@",
             ColorPair::new(RGB::named(YELLOW), RGB::named(BLACK)),
         );
+
+        // Toast overlay: stacked in the top-right quadrant (rows 0-3, cols 40-79)
+        let toast_bg = RGB::from_f32(0.05, 0.05, 0.18);
+        for (i, toast) in self.toasts.iter().enumerate() {
+            draw_batch.print_color(
+                Point::new(TOAST_X, i as i32),
+                toast.message,
+                ColorPair::new(toast.color, toast_bg),
+            );
+        }
 
         // HUD row 48: log message (pre-padded to 80 chars)
         draw_batch.print_color(
@@ -599,6 +690,7 @@ impl GameState for State {
     fn tick(&mut self, ctx: &mut BTerm) {
         match self.run_state {
             RunState::Running => {
+                self.update_toasts(ctx.frame_time_ms);
                 let mut player_moved = false;
                 if let Some(key) = ctx.key {
                     match key {
@@ -624,6 +716,10 @@ impl GameState for State {
 
                 if player_moved {
                     self.update_fov();
+                    if self.fov_toast_cooldown <= 0.0 {
+                        self.push_toast(TOAST_FOV, RGB::named(CYAN));
+                        self.fov_toast_cooldown = FOV_TOAST_COOLDOWN_MS;
+                    }
                 }
 
                 // Monsters move on their own timer, independent of player input.
